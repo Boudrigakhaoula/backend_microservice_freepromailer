@@ -16,7 +16,8 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 /**
  * CORRECTIONS :
  *   1. PAS de @Transactional sur la méthode principale
@@ -168,5 +169,83 @@ public class CsvImportService {
     private String truncate(String value, int maxLength) {
         if (value == null || value.isBlank()) return null;
         return value.length() > maxLength ? value.substring(0, maxLength) : value;
+    }
+    public Map<String, Object> importExcel(MultipartFile file, Long contactListId) {
+        ContactList list = contactListRepo.findById(contactListId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Liste de contacts", contactListId));
+
+        int imported = 0, skipped = 0, errors = 0;
+        List<String> errorDetails = new ArrayList<>();
+
+        try (Workbook workbook = new XSSFWorkbook(file.getInputStream())) {
+            Sheet sheet = workbook.getSheetAt(0);
+            int lineNumber = 0;
+
+            for (Row row : sheet) {
+                lineNumber++;
+                if (lineNumber == 1) continue; // Skip header
+
+                try {
+                    String email = getCellValue(row, 0);
+                    if (email == null || email.isBlank() || !email.contains("@")) {
+                        errors++;
+                        errorDetails.add("Ligne " + lineNumber + " : email invalide '" + email + "'");
+                        continue;
+                    }
+
+                    email = truncate(email.toLowerCase().trim(), 250);
+
+                    if (contactRepo.existsByEmailAndContactList_Id(email, contactListId)) {
+                        skipped++;
+                        continue;
+                    }
+
+                    Contact contact = Contact.builder()
+                            .email(email)
+                            .firstName(truncate(getCellValue(row, 1), 250))
+                            .lastName(truncate(getCellValue(row, 2), 250))
+                            .company(truncate(getCellValue(row, 3), 250))
+                            .phone(truncate(getCellValue(row, 4), 50))
+                            .contactList(list)
+                            .status(ContactStatus.ACTIVE)
+                            .build();
+
+                    contactRepo.save(contact);
+                    imported++;
+
+                } catch (Exception e) {
+                    errors++;
+                    errorDetails.add("Ligne " + lineNumber + " : " + e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Erreur lecture Excel : " + e.getMessage());
+        }
+
+        log.info("📥 Import Excel terminé : {} importés, {} ignorés, {} erreurs",
+                imported, skipped, errors);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("imported", imported);
+        result.put("skipped", skipped);
+        result.put("errors", errors);
+        if (!errorDetails.isEmpty()) {
+            result.put("errorDetails", errorDetails.subList(0, Math.min(errorDetails.size(), 20)));
+        }
+        return result;
+    }
+
+    // Utilitaire pour lire une cellule Excel
+    private String getCellValue(Row row, int index) {
+        if (row == null) return null;
+        Cell cell = row.getCell(index, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+        if (cell == null) return null;
+        return switch (cell.getCellType()) {
+            case STRING  -> cell.getStringCellValue().trim();
+            case NUMERIC -> String.valueOf((long) cell.getNumericCellValue());
+            case BOOLEAN -> String.valueOf(cell.getBooleanCellValue());
+            default      -> null;
+        };
     }
 }

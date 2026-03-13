@@ -2,12 +2,14 @@ package com.pfe.campaignservice.dto;
 
 import lombok.*;
 import java.time.LocalDateTime;
+import java.util.List;
 
 @Data
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
 public class CampaignResponse {
+
     private Long id;
     private String name;
     private String subject;
@@ -28,4 +30,21 @@ public class CampaignResponse {
     private LocalDateTime sentAt;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
+
+
+    private Long userId;
+    private List<AttachmentResponse> attachments;
+
+    // Classe interne pour les pièces jointes
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class AttachmentResponse {
+        private Long id;
+        private String fileName;
+        private Long fileSize;
+        private String contentType;
+        private LocalDateTime createdAt;
+    }
 }

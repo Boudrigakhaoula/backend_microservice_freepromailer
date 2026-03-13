@@ -39,9 +39,6 @@ public class MessageDequeuer {
     private final DkimSigner dkimSigner;
 
     // ─── Configuration générale ───
-    @Value("${smtp.dequeue.batch-size:10}")
-    private int batchSize;
-
     @Value("${smtp.dequeue.lock-timeout-minutes:5}")
     private int lockTimeoutMinutes;
 
@@ -73,28 +70,83 @@ public class MessageDequeuer {
     @Value("${smtp.relay.starttls:true}")
     private boolean relayStartTls;
 
-    // ─────────────────────────────────────────────────────────
-    //  SCHEDULER — Toutes les 5 secondes, traite les messages
-    // ─────────────────────────��───────────────────────────────
+    // ─── Configuration Fair Scheduler ───
+    @Value("${smtp.scheduler.max-per-second:12}")
+    private int maxPerSecond;
 
-    @Scheduled(fixedDelayString = "${smtp.dequeue.poll-interval-ms:5000}")
+    @Value("${smtp.scheduler.daily-limit:50000}")
+    private int dailyLimit;
+
+    // ─────────────────────────────────────────────────────────
+    //  SCHEDULER — Fair scheduler, toutes les secondes
+    // ─────────────────────────────────────────────────────────
+
+    @Scheduled(fixedDelayString = "${smtp.dequeue.poll-interval-ms:1000}")
     public void processQueue() {
-        // 1. Libérer les messages verrouillés depuis trop longtemps (crash recovery)
+        // 0. Lock recovery
         unlockStaleMessages();
 
-        // 2. Récupérer les messages prêts à envoyer
-        List<QueuedMessage> messages = queuedRepo.findMessagesReadyToSend(
-                MessageStatus.QUEUED,
-                LocalDateTime.now(),
-                org.springframework.data.domain.PageRequest.of(0, batchSize)
-        );
+        // 1. Vérifier quota journalier
+        LocalDateTime startOfDay = LocalDateTime.now().toLocalDate().atStartOfDay();
+        long sentToday = queuedRepo.countSentToday(startOfDay);
+        if (sentToday >= dailyLimit) {
+            log.warn("🚫 Quota journalier atteint : {}/{} emails envoyés aujourd'hui",
+                    sentToday, dailyLimit);
+            return;
+        }
 
-        for (QueuedMessage msg : messages) {
-            try {
-                processMessage(msg);
-            } catch (Exception e) {
-                log.error("Erreur inattendue traitement message #{} : {}", msg.getId(), e.getMessage());
+        long remaining = dailyLimit - sentToday;
+        int capacity = (int) Math.min(maxPerSecond, remaining);
+
+        // 2. Lister les senders actifs triés par volume ASC (petits volumes en premier)
+        List<Object[]> senderStats = queuedRepo.countPendingBySender(LocalDateTime.now());
+        if (senderStats.isEmpty()) return;
+
+        int numSenders = senderStats.size();
+
+        // 3. Calculer le quota par sender (règles métier)
+        //    Cas 1 : = 12 senders → 1 chacun
+        //    Cas 2 : < 12 senders → partage équitable
+        //    Cas 3 : > 12 senders → 1 chacun, sélectionner les 12 MIN pending
+        List<Object[]> selectedSenders;
+        int quotaPerSender;
+
+        if (numSenders <= capacity) {
+            // Cas 1 & 2 : tous les senders participent
+            selectedSenders = senderStats;
+            quotaPerSender = Math.max(1, capacity / numSenders);
+        } else {
+            // Cas 3 : trop de senders — prendre les 12 avec le moins de messages
+            selectedSenders = senderStats.subList(0, capacity);
+            quotaPerSender = 1;
+        }
+
+        log.info("⚡ Fair scheduler : {} senders, capacity={}, quota/sender={}",
+                selectedSenders.size(), capacity, quotaPerSender);
+
+        // 4. Pour chaque sender sélectionné, prendre son quota et envoyer
+        int totalSent = 0;
+        for (Object[] row : selectedSenders) {
+            String senderId = (String) row[0];
+            int quota = Math.min(quotaPerSender, capacity - totalSent);
+            if (quota <= 0) break;
+
+            List<QueuedMessage> messages = queuedRepo.pickMessagesForSender(
+                    senderId, quota, LocalDateTime.now());
+
+            for (QueuedMessage msg : messages) {
+                try {
+                    processMessage(msg);
+                    totalSent++;
+                } catch (Exception e) {
+                    log.error("Erreur traitement message #{} : {}", msg.getId(), e.getMessage());
+                }
             }
+        }
+
+        if (totalSent > 0) {
+            log.info("✅ Cycle terminé : {} emails traités ({}/{} envoyés aujourd'hui)",
+                    totalSent, sentToday + totalSent, dailyLimit);
         }
     }
 

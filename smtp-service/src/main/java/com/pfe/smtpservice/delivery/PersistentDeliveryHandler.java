@@ -40,7 +40,8 @@ public class PersistentDeliveryHandler implements MailDeliveryHandler {
                     null,                 // htmlBody (SMTP entrant = text)
                     null,                 // campaignId
                     null,                 // contactId
-                    null                  // tag
+                    null,                 // tag
+                    null                  // senderId (SMTP entrant = anonymous)
             );
         }
 

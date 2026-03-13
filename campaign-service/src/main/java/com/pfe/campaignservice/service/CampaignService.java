@@ -11,6 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 @Slf4j
@@ -22,6 +23,7 @@ public class CampaignService {
     private final ContactListRepository contactListRepo;
     private final EmailTemplateRepository templateRepo;
     private final ContactRepository contactRepo;
+    private final CampaignExecutionService executionService;
 
     /**
      * FIX : Utilise findAllWithRelations() → JOIN FETCH
@@ -127,6 +129,187 @@ public class CampaignService {
     @Transactional
     public void delete(Long id) {
         campaignRepo.deleteById(id);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  LIFECYCLE — start / restart / pause / resume / cancel
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * START — DRAFT ou PENDING → lance l'exécution immédiatement.
+     * Si la campagne est COMPLETED, FAILED ou CANCELLED, réinitialise les compteurs
+     * et relance (équivalent d'un restart automatique).
+     */
+    @Transactional
+    public CampaignResponse startCampaign(Long id) {
+        Campaign campaign = campaignRepo.findByIdWithRelations(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Campagne", id));
+
+        if (campaign.getContactList() == null) {
+            throw new IllegalStateException(
+                    "La campagne n'a pas de liste de contacts. Assignez-en une avant de démarrer.");
+        }
+        if (campaign.getSubject() == null || campaign.getSubject().isBlank()) {
+            throw new IllegalStateException(
+                    "La campagne n'a pas de sujet (subject). Remplissez-le avant de démarrer.");
+        }
+
+        // Si campagne déjà terminée/annulée/échouée → reset et relance
+        if (campaign.getStatus() == CampaignStatus.COMPLETED
+                || campaign.getStatus() == CampaignStatus.CANCELLED
+                || campaign.getStatus() == CampaignStatus.FAILED) {
+            log.info("🔄 Restart automatique campagne #{} '{}' (statut: {})",
+                    campaign.getId(), campaign.getName(), campaign.getStatus());
+            resetCampaignCounters(campaign);
+        } else if (campaign.getStatus() != CampaignStatus.DRAFT
+                && campaign.getStatus() != CampaignStatus.PENDING) {
+            throw new IllegalStateException(
+                    "Impossible de démarrer une campagne avec le statut : "
+                            + campaign.getStatus()
+                            + ". Statuts autorisés : DRAFT, PENDING, COMPLETED, FAILED, CANCELLED");
+        }
+
+        log.info("▶ Démarrage campagne #{} '{}'", campaign.getId(), campaign.getName());
+        executionService.executeCampaign(campaign);
+        return toResponse(campaignRepo.findByIdWithRelations(id).orElseThrow());
+    }
+
+    /**
+     * RESTART — COMPLETED, FAILED, CANCELLED ou PAUSED → réinitialise les compteurs et renvoie tout.
+     * Utile pour renvoyer explicitement une campagne terminée à tous les contacts.
+     */
+    @Transactional
+    public CampaignResponse restartCampaign(Long id) {
+        Campaign campaign = campaignRepo.findByIdWithRelations(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Campagne", id));
+
+        if (campaign.getStatus() != CampaignStatus.COMPLETED
+                && campaign.getStatus() != CampaignStatus.FAILED
+                && campaign.getStatus() != CampaignStatus.CANCELLED
+                && campaign.getStatus() != CampaignStatus.PAUSED) {
+            throw new IllegalStateException(
+                    "Impossible de redémarrer une campagne avec le statut : "
+                            + campaign.getStatus()
+                            + ". Statuts autorisés : COMPLETED, FAILED, PAUSED, CANCELLED");
+        }
+        if (campaign.getContactList() == null) {
+            throw new IllegalStateException(
+                    "La campagne n'a pas de liste de contacts.");
+        }
+
+        log.info("🔄 Redémarrage campagne #{} '{}'", campaign.getId(), campaign.getName());
+        resetCampaignCounters(campaign);
+        executionService.executeCampaign(campaign);
+        return toResponse(campaignRepo.findByIdWithRelations(id).orElseThrow());
+    }
+
+    /**
+     * Réinitialise les compteurs d'une campagne avant un restart.
+     * Remet totalSent, totalFailed, totalRecipients à 0 et efface la date d'envoi.
+     */
+    private void resetCampaignCounters(Campaign campaign) {
+        campaign.setTotalSent(0);
+        campaign.setTotalFailed(0);
+        campaign.setTotalRecipients(0);
+        campaign.setSentAt(null);
+        campaignRepo.save(campaign);
+        log.info("🔁 Compteurs réinitialisés pour campagne #{}", campaign.getId());
+    }
+
+    /**
+     * Mise à jour des stats d'une campagne après chaque envoi batch.
+     * Appelé par smtp-service via webhook ou par CampaignExecutionService.
+     * Passe automatiquement en COMPLETED si tous les emails ont été traités.
+     */
+    @Transactional
+    public void updateCampaignStats(Long campaignId, int sent, int failed) {
+        Campaign campaign = campaignRepo.findById(campaignId)
+                .orElseThrow(() -> new ResourceNotFoundException("Campagne", campaignId));
+
+        campaign.setTotalSent(sent);
+        campaign.setTotalFailed(failed);
+
+        long totalProcessed = (long) sent + failed;
+        if (campaign.getTotalRecipients() > 0
+                && totalProcessed >= campaign.getTotalRecipients()
+                && campaign.getStatus() == CampaignStatus.IN_PROGRESS) {
+            campaign.setStatus(CampaignStatus.COMPLETED);
+            campaign.setSentAt(LocalDateTime.now());
+            log.info("✅ Campagne #{} automatiquement passée en COMPLETED ({} envoyés, {} échoués)",
+                    campaignId, sent, failed);
+        }
+
+        campaignRepo.save(campaign);
+    }
+
+    /**
+     * PAUSE — IN_PROGRESS → PAUSED.
+     * Les messages déjà en queue dans smtp-service continueront d'être envoyés
+     * (ils sont déjà sortis de la campagne). Seul le dispatch de nouveaux batches s'arrête.
+     */
+    @Transactional
+    public CampaignResponse pauseCampaign(Long id) {
+        Campaign campaign = campaignRepo.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Campagne", id));
+
+        if (campaign.getStatus() != CampaignStatus.IN_PROGRESS
+                && campaign.getStatus() != CampaignStatus.PENDING) {
+            throw new IllegalStateException(
+                    "Impossible de mettre en pause une campagne avec le statut : "
+                            + campaign.getStatus()
+                            + ". Statut requis : IN_PROGRESS");
+        }
+
+        campaign.setStatus(CampaignStatus.PAUSED);
+        campaignRepo.save(campaign);
+        log.info("⏸ Campagne #{} '{}' mise en pause", campaign.getId(), campaign.getName());
+        return toResponse(campaign);
+    }
+
+    /**
+     * RESUME — PAUSED → reprend l'exécution là où elle s'était arrêtée.
+     * Renvoie uniquement aux contacts qui n'ont pas encore reçu l'email
+     * (totalSent est conservé, on repart du contact suivant).
+     */
+    @Transactional
+    public CampaignResponse resumeCampaign(Long id) {
+        Campaign campaign = campaignRepo.findByIdWithRelations(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Campagne", id));
+
+        if (campaign.getStatus() != CampaignStatus.PAUSED) {
+            throw new IllegalStateException(
+                    "Impossible de reprendre une campagne avec le statut : "
+                            + campaign.getStatus()
+                            + ". Statut requis : PAUSED");
+        }
+
+        log.info("▶ Reprise campagne #{} '{}' (déjà envoyé : {})",
+                campaign.getId(), campaign.getName(), campaign.getTotalSent());
+        executionService.resumeCampaign(campaign);
+        return toResponse(campaignRepo.findByIdWithRelations(id).orElseThrow());
+    }
+
+    /**
+     * CANCEL — n'importe quel statut actif → CANCELLED.
+     * Arrête définitivement la campagne.
+     */
+    @Transactional
+    public CampaignResponse cancelCampaign(Long id) {
+        Campaign campaign = campaignRepo.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Campagne", id));
+
+        if (campaign.getStatus() == CampaignStatus.COMPLETED) {
+            throw new IllegalStateException(
+                    "Impossible d'annuler une campagne déjà terminée (COMPLETED). Utilisez restart si nécessaire.");
+        }
+        if (campaign.getStatus() == CampaignStatus.CANCELLED) {
+            throw new IllegalStateException("La campagne est déjà annulée.");
+        }
+
+        campaign.setStatus(CampaignStatus.CANCELLED);
+        campaignRepo.save(campaign);
+        log.info("🚫 Campagne #{} '{}' annulée", campaign.getId(), campaign.getName());
+        return toResponse(campaign);
     }
 
     @Transactional(readOnly = true)

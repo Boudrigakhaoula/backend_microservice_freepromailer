@@ -7,10 +7,11 @@ import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "queued_messages", indexes = {
-        @Index(name = "idx_queued_status", columnList = "status"),
-        @Index(name = "idx_queued_retry", columnList = "status, retryAfter"),
+        @Index(name = "idx_queued_status",   columnList = "status"),
+        @Index(name = "idx_queued_retry",    columnList = "status, retryAfter"),
         @Index(name = "idx_queued_campaign", columnList = "campaignId"),
-        @Index(name = "idx_queued_tracking", columnList = "trackingId")
+        @Index(name = "idx_queued_tracking", columnList = "trackingId"),
+        @Index(name = "idx_queued_sender",   columnList = "senderId, status")
 })
 @Data
 @Builder
@@ -40,6 +41,9 @@ public class QueuedMessage {
     private String contactId;
     private String trackingId;
     private String tag;
+
+    /** userId du sender — utilisé pour l'équilibrage round-robin */
+    private String senderId;
 
     @Builder.Default
     private int attempts = 0;

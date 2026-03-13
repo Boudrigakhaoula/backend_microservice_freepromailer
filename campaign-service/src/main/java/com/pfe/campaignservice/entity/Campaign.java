@@ -62,6 +62,13 @@ public class Campaign {
 
     private String tag;
 
+    /** userId du propriétaire — utilisé pour le fair scheduler */
+    private Long userId;
+
+    @OneToMany(mappedBy = "campaign", cascade = CascadeType.ALL, orphanRemoval = true)
+    @Builder.Default
+    private java.util.List<Attachment> attachments = new java.util.ArrayList<>();
+
     @Builder.Default
     private int totalRecipients = 0;
 

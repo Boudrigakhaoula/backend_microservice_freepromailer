@@ -34,6 +34,7 @@
         <module>ai-service</module>
         <module>notification-service</module>
         <module>reporting-service</module>
+        <module>auth-service</module>
     </modules>
 
     <dependencyManagement>

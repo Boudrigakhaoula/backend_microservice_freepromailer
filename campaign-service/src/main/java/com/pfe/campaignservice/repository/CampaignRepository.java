@@ -47,4 +47,12 @@ public interface CampaignRepository extends JpaRepository<Campaign, Long> {
     List<Campaign> findByStatus(CampaignStatus status);
 
     List<Campaign> findByStatusAndScheduledAtBefore(CampaignStatus status, LocalDateTime now);
+    @Query("""
+    SELECT c FROM Campaign c
+    LEFT JOIN FETCH c.contactList
+    LEFT JOIN FETCH c.template
+    WHERE c.userId = :userId
+    ORDER BY c.createdAt DESC
+""")
+    List<Campaign> findByUserIdWithRelations(@Param("userId") Long userId);
 }

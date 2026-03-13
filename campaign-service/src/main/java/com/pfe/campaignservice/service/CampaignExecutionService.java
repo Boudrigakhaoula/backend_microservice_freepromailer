@@ -25,6 +25,7 @@ public class CampaignExecutionService {
     private final CampaignRepository campaignRepo;
     private final ContactRepository contactRepo;
     private final SmtpServiceClient smtpClient;
+    private final AttachmentService attachmentService;
 
     @Value("${campaign.sending.batch-size:50}")
     private int batchSize;
@@ -36,7 +37,7 @@ public class CampaignExecutionService {
     @Transactional
     public void processScheduledCampaigns() {
         List<Campaign> readyCampaigns = campaignRepo
-                .findByStatusAndScheduledAtBefore(CampaignStatus.SCHEDULED, LocalDateTime.now());
+                .findByStatusAndScheduledAtBefore(CampaignStatus.PENDING, LocalDateTime.now());
 
         for (Campaign campaign : readyCampaigns) {
             log.info("⏰ Campagne planifiée prête : #{} '{}'",
@@ -49,15 +50,14 @@ public class CampaignExecutionService {
     public void executeCampaign(Campaign campaign) {
         if (campaign.getContactList() == null) {
             log.error("❌ Campagne #{} n'a pas de liste de contacts", campaign.getId());
-            campaign.setStatus(CampaignStatus.PAUSED);
+            campaign.setStatus(CampaignStatus.FAILED);
             campaignRepo.save(campaign);
             return;
         }
 
-        campaign.setStatus(CampaignStatus.SENDING);
+        campaign.setStatus(CampaignStatus.IN_PROGRESS);
         campaignRepo.save(campaign);
 
-        // ← CORRIGÉ : findByContactList_IdAndStatus
         List<Contact> activeContacts = contactRepo.findByContactList_IdAndStatus(
                 campaign.getContactList().getId(), ContactStatus.ACTIVE);
 
@@ -70,8 +70,16 @@ public class CampaignExecutionService {
         int failed = 0;
 
         for (int i = 0; i < activeContacts.size(); i++) {
-            Contact contact = activeContacts.get(i);
+            // ── PAUSE CHECK : si la campagne a été mise en pause entre-temps ──
+            if (isCampaignPaused(campaign.getId())) {
+                log.info("⏸ Campagne #{} mise en pause après {} envois", campaign.getId(), sent);
+                campaign.setTotalSent(campaign.getTotalSent() + sent);
+                campaign.setTotalFailed(campaign.getTotalFailed() + failed);
+                campaignRepo.save(campaign);
+                return;
+            }
 
+            Contact contact = activeContacts.get(i);
             try {
                 sendToContact(campaign, contact);
                 sent++;
@@ -94,7 +102,7 @@ public class CampaignExecutionService {
 
         campaign.setTotalSent(sent);
         campaign.setTotalFailed(failed);
-        campaign.setStatus(CampaignStatus.SENT);
+        campaign.setStatus(CampaignStatus.COMPLETED);
         campaign.setSentAt(LocalDateTime.now());
         campaignRepo.save(campaign);
 
@@ -102,10 +110,98 @@ public class CampaignExecutionService {
                 campaign.getName(), sent, activeContacts.size(), failed);
     }
 
+    /**
+     * RESUME — reprend depuis l'index totalSent (skip les contacts déjà traités).
+     */
+    @Transactional
+    public void resumeCampaign(Campaign campaign) {
+        if (campaign.getContactList() == null) {
+            throw new IllegalStateException("La campagne n'a pas de liste de contacts.");
+        }
+
+        campaign.setStatus(CampaignStatus.IN_PROGRESS);
+        campaignRepo.save(campaign);
+
+        List<Contact> activeContacts = contactRepo.findByContactList_IdAndStatus(
+                campaign.getContactList().getId(), ContactStatus.ACTIVE);
+
+        // Reprendre à partir du nombre déjà envoyé (skip les premiers)
+        int alreadySent   = campaign.getTotalSent();
+        int alreadyFailed = campaign.getTotalFailed();
+
+        if (alreadySent >= activeContacts.size()) {
+            log.info("✅ Campagne #{} déjà complète ({}/{} contacts), passage à SENT",
+                    campaign.getId(), alreadySent, activeContacts.size());
+            campaign.setStatus(CampaignStatus.COMPLETED);
+            campaign.setSentAt(LocalDateTime.now());
+            campaignRepo.save(campaign);
+            return;
+        }
+
+        List<Contact> remaining = activeContacts.subList(alreadySent, activeContacts.size());
+        log.info("▶ Reprise campagne '{}' : {} contacts restants (déjà traités : {})",
+                campaign.getName(), remaining.size(), alreadySent);
+
+        int sent = 0;
+        int failed = 0;
+
+        for (int i = 0; i < remaining.size(); i++) {
+            // ── PAUSE CHECK ──
+            if (isCampaignPaused(campaign.getId())) {
+                log.info("⏸ Campagne #{} mise en pause après {} envois supplémentaires",
+                        campaign.getId(), sent);
+                campaign.setTotalSent(alreadySent + sent);
+                campaign.setTotalFailed(alreadyFailed + failed);
+                campaignRepo.save(campaign);
+                return;
+            }
+
+            Contact contact = remaining.get(i);
+            try {
+                sendToContact(campaign, contact);
+                sent++;
+            } catch (Exception e) {
+                failed++;
+                log.error("❌ Échec envoi à {} : {}", contact.getEmail(), e.getMessage());
+            }
+
+            if ((i + 1) % batchSize == 0 && delayBetweenBatch > 0) {
+                try {
+                    Thread.sleep(delayBetweenBatch);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+
+        campaign.setTotalSent(alreadySent + sent);
+        campaign.setTotalFailed(alreadyFailed + failed);
+        campaign.setStatus(CampaignStatus.COMPLETED);
+        campaign.setSentAt(LocalDateTime.now());
+        campaignRepo.save(campaign);
+
+        log.info("✅ Campagne '{}' terminée après reprise : {}/{} envoyés total",
+                campaign.getName(), alreadySent + sent, activeContacts.size());
+    }
+
+    /**
+     * Vérifie en DB si la campagne a été mise en pause ou annulée pendant l'exécution.
+     * Appelé à chaque batch pour détecter une interruption externe.
+     */
+    private boolean isCampaignPaused(Long campaignId) {
+        return campaignRepo.findById(campaignId)
+                .map(c -> c.getStatus() == CampaignStatus.PAUSED
+                        || c.getStatus() == CampaignStatus.CANCELLED)
+                .orElse(false);
+    }
+
     private void sendToContact(Campaign campaign, Contact contact) {
         String personalizedSubject = personalizeContent(campaign.getSubject(), contact);
-        String personalizedHtml = personalizeContent(campaign.getHtmlContent(), contact);
-        String personalizedText = personalizeContent(campaign.getTextContent(), contact);
+        String personalizedHtml    = personalizeContent(campaign.getHtmlContent(), contact);
+        String personalizedText    = personalizeContent(campaign.getTextContent(), contact);
+
+        List<String> attachmentPaths = attachmentService.getPathsByCampaign(campaign.getId());
 
         SendEmailRequest request = SendEmailRequest.builder()
                 .from(campaign.getFromEmail())
@@ -116,6 +212,8 @@ public class CampaignExecutionService {
                 .campaignId(campaign.getId().toString())
                 .contactId(contact.getId().toString())
                 .tag(campaign.getTag())
+                .senderId(campaign.getUserId() != null ? campaign.getUserId().toString() : null)
+                .attachmentPaths(attachmentPaths.isEmpty() ? null : attachmentPaths)
                 .build();
 
         smtpClient.sendCampaignEmail(request);

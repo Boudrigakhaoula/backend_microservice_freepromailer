@@ -25,7 +25,8 @@ public class MessageQueue {
      */
     public QueuedMessage enqueue(String from, String to, String subject,
                                  String textBody, String htmlBody,
-                                 String campaignId, String contactId, String tag) {
+                                 String campaignId, String contactId,
+                                 String tag, String senderId) {
 
         String trackingId = UUID.randomUUID().toString();
 
@@ -38,12 +39,14 @@ public class MessageQueue {
                 .campaignId(campaignId)
                 .contactId(contactId)
                 .tag(tag)
+                .senderId(senderId)
                 .trackingId(trackingId)
                 .status(MessageStatus.QUEUED)
                 .build();
 
         repo.save(msg);
-        log.info("📩 En queue #{} → {} [tracking={}]", msg.getId(), to, trackingId);
+        log.info("📩 En queue #{} → {} [sender={} tracking={}]",
+                msg.getId(), to, senderId, trackingId);
         return msg;
     }
 

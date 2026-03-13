@@ -4,8 +4,14 @@ import com.pfe.campaignservice.dto.ContactRequest;
 import com.pfe.campaignservice.entity.Contact;
 import com.pfe.campaignservice.service.ContactService;
 import com.pfe.campaignservice.service.CsvImportService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.parameters.RequestBody;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
@@ -64,29 +70,56 @@ public class ContactController {
     }
 
     /**
-     * Import CSV.
-     *
-     * URL CORRECTE dans Postman :
-     *   POST http://localhost:8080/api/contacts/import?listId=1
-     *
-     * ❌ ERREUR COURANTE :
-     *   POST http://localhost:8080/api/contacts/import/1
-     *   → retourne "No static resource api/contacts/import/1"
-     *
-     * Body → form-data :
-     *   Key: file   Type: File   Value: (sélectionner le fichier CSV)
+     * ✅ Import CSV/Excel — multipart/form-data
+     * Swagger affichera un bouton "Choose File"
      */
-    @PostMapping("/import")
-    public ResponseEntity<Map<String, Object>> importCsv(
+    @Operation(
+            summary = "Importer des contacts depuis un fichier CSV ou Excel",
+            requestBody = @RequestBody(
+                    content = @Content(
+                            mediaType = MediaType.MULTIPART_FORM_DATA_VALUE,
+                            schema = @Schema(implementation = ImportRequest.class)
+                    )
+            )
+    )
+    @PostMapping(value = "/import", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, Object>> importContacts(
+            @Parameter(description = "Fichier CSV ou Excel", required = true)
             @RequestParam("file") MultipartFile file,
+            @Parameter(description = "ID de la liste de contacts", required = true)
             @RequestParam("listId") Long listId) {
 
         if (file.isEmpty()) {
             return ResponseEntity.badRequest()
-                    .body(Map.of("error", "Le fichier CSV est vide"));
+                    .body(Map.of("error", "Le fichier est vide"));
         }
 
-        Map<String, Object> result = csvImportService.importCsv(file, listId);
+        String filename = file.getOriginalFilename() != null
+                ? file.getOriginalFilename().toLowerCase() : "";
+
+        Map<String, Object> result;
+
+        if (filename.endsWith(".xlsx") || filename.endsWith(".xls")) {
+            // Import Excel
+            result = csvImportService.importExcel(file, listId);
+        } else if (filename.endsWith(".csv")) {
+            // Import CSV
+            result = csvImportService.importCsv(file, listId);
+        } else {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("error", "Format non supporté. Utilisez CSV ou Excel (.xlsx, .xls)"));
+        }
+
         return ResponseEntity.ok(result);
+    }
+
+    // ─── Classe interne pour la doc Swagger ───
+    @Schema(name = "ImportRequest", description = "Formulaire d'import de contacts")
+    static class ImportRequest {
+        @Schema(description = "Fichier CSV ou Excel", type = "string", format = "binary", required = true)
+        public MultipartFile file;
+
+        @Schema(description = "ID de la liste de contacts", example = "1", required = true)
+        public Long listId;
     }
 }

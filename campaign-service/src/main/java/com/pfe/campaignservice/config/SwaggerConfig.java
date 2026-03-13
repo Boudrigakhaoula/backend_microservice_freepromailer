@@ -1,8 +1,8 @@
 package com.pfe.campaignservice.config;
 
-import io.swagger.v3.oas.models.OpenAPI;
-import io.swagger.v3.oas.models.info.Contact;
-import io.swagger.v3.oas.models.info.Info;
+import io.swagger.v3.oas.models.*;
+import io.swagger.v3.oas.models.info.*;
+import io.swagger.v3.oas.models.security.*;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -30,6 +30,15 @@ public class SwaggerConfig {
                                 .name("Khaoula Boudriga")
                                 .email("khaoula@khaoulaboudriga.me")
                         )
-                );
+                )
+                // ✅ AJOUTER CES LIGNES
+                .addSecurityItem(new SecurityRequirement().addList("Bearer Auth"))
+                .components(new Components()
+                        .addSecuritySchemes("Bearer Auth",
+                                new SecurityScheme()
+                                        .name("Bearer Auth")
+                                        .type(SecurityScheme.Type.HTTP)
+                                        .scheme("bearer")
+                                        .bearerFormat("JWT")));
     }
 }
